@@ -8,6 +8,12 @@ privacy in mind.
 
 # Design
 
+Client Side
+
+Server Side
+
+Cli
+
 
 # Componenets
 
