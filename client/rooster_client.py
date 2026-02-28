@@ -90,11 +90,14 @@ class Define:
         project_description: str,
         session_name: str,
         framework: Literal["jax", "pytorch", "tensorflow"],
+        metrics: dict[str, "MetricDef"],
     ):
         if framework not in self.SUPPORTED_FRAMEWORKS:
             raise ValueError(
                 f"Unsupported framework '{framework}'. Must be one of: {self.SUPPORTED_FRAMEWORKS}"
             )
+        if not metrics:
+            raise ValueError("At least one metric must be declared in Define(metrics={...})")
 
         self.project = Project(
             name=project_name,
@@ -108,18 +111,47 @@ class Define:
             framework=framework,
         )
 
+        self.metrics: dict[str, MetricDef] = metrics
+
 
 @pydantic.dataclasses.dataclass
-class MetricRecord:
+class MetricDef:
+    """User declares a metric by name and rate only.
+    dtype is inferred automatically from the first logged value — not set by the user.
+    """
+    rate: int = 1
+
+
+@pydantic.dataclasses.dataclass
+class LogEntry:
+    kind: str
     step: int
     timestamp: datetime.datetime
-    metrics: dict[str, MetricValue]
+    data: dict[str, MetricValue]
+    # dtype is inferred by _coerce and carried implicitly by the MetricValue type.
+    # The parser detects it; the server records it in the session's metrics map.
+    dtype: str = ""   # populated by Collect.log() — "float", "int", "str", "bool"
+
+
+def _infer_dtype(val: MetricValue) -> str:
+    if isinstance(val, bool):
+        return "bool"
+    if isinstance(val, int):
+        return "int"
+    if isinstance(val, float):
+        return "float"
+    return "str"
 
 
 class Collect:
-    def __init__(self, framework: Literal["jax", "pytorch", "tensorflow"]):
+    def __init__(
+        self,
+        framework: Literal["jax", "pytorch", "tensorflow"],
+        metrics: dict[str, MetricDef],
+    ):
         self.framework = framework
-        self.records: list[MetricRecord] = []
+        self.metrics = metrics          # declared metrics — name → MetricDef(rate)
+        self.entries: list[LogEntry] = []
         self._step = 0
         self._stream: "tuple[Send, Arrange] | None" = None
 
@@ -127,27 +159,44 @@ class Collect:
         """Wire up live streaming. After calling this, every log() sends immediately."""
         self._stream = (sender, arranger)
 
-    def log(self, metrics: dict[str, Any], step: int | None = None):
+    def log(self, data: dict[str, Any], kind: str, step: int | None = None):
+        # kind must be declared — enforces explicit metric definition
+        if kind not in self.metrics:
+            raise ValueError(
+                f"Metric '{kind}' was not declared. "
+                f"Add it to Define(metrics={{...}}) before logging."
+            )
         if step is not None:
             self._step = step
-        record = MetricRecord(
+
+        coerced = {k: _coerce(v) for k, v in data.items()}
+        # infer dtype from the first value — the parser catches the type automatically
+        first_val = next(iter(coerced.values())) if coerced else 0.0
+        dtype = _infer_dtype(first_val)
+
+        entry = LogEntry(
+            kind=kind,
             step=self._step,
             timestamp=datetime.datetime.utcnow(),
-            metrics={k: _coerce(v) for k, v in metrics.items()},
+            data=coerced,
+            dtype=dtype,
         )
         self._step += 1
+
         if self._stream is not None:
             sender, arranger = self._stream
-            sender._send(arranger.step_payload(record))
+            payload = arranger.step_payload(entry)
+            if payload is not None:
+                sender._send(payload)
         else:
-            self.records.append(record)
+            self.entries.append(entry)
 
-    def parse(self, metrics: str):
+    def parse(self, data: str, kind: str = "metric"):
         try:
-            parsed = json.loads(metrics)
+            parsed = json.loads(data)
         except json.JSONDecodeError:
             parsed = {}
-            for part in metrics.split(","):
+            for part in data.split(","):
                 part = part.strip()
                 if "=" in part:
                     k, _, v = part.partition("=")
@@ -155,7 +204,7 @@ class Collect:
                         parsed[k.strip()] = float(v.strip())
                     except ValueError:
                         parsed[k.strip()] = v.strip()
-        self.log(parsed)
+        self.log(parsed, kind=kind)
 
     def as_keras_callback(self):
         if self.framework != "tensorflow":
@@ -169,7 +218,7 @@ class Collect:
 
         class _RoosterCallback(tf.keras.callbacks.Callback):
             def on_epoch_end(self, epoch, logs=None):
-                collector.log(metrics=logs or {}, step=epoch)
+                collector.log(data=logs or {}, kind="epoch", step=epoch)
 
         return _RoosterCallback()
 
@@ -182,18 +231,26 @@ class Collect:
         def wrapped(*args, **kwargs):
             result = step_fn(*args, **kwargs)
             if isinstance(result, dict):
-                collector.log(result)
+                collector.log(result, kind="step")
             return result
 
         return wrapped
 
 
 class Arrange:
-    """Serializes Define + Collect data into wire-ready payloads."""
+    """Formats LogEntry data into wire-ready payloads.
+
+    Rate is per-metric, taken from the MetricDef declared in Define(metrics={...}).
+    No global rate — each metric controls its own send frequency independently.
+    """
 
     def __init__(self, definition: Define, collector: Collect):
         self.definition = definition
         self.collector = collector
+        self._counters: dict[str, int] = {}   # per-metric call counter
+
+    def _session_id(self) -> str:
+        return str(self.definition.session.session_id)
 
     def registration_payload(self) -> dict:
         sess = self.definition.session
@@ -210,42 +267,57 @@ class Arrange:
                 "name": sess.name,
                 "framework": sess.framework,
             },
+            # Metric schema sent upfront — dtype is absent here, inferred server-side
+            # from the first log entry for each metric.
+            "metrics": {
+                name: {"rate": mdef.rate}
+                for name, mdef in self.definition.metrics.items()
+            },
         }
 
-    def step_payload(self, record: MetricRecord) -> dict:
-        """Single-record payload for live streaming — one per forward step."""
+    def step_payload(self, entry: LogEntry) -> dict | None:
+        """Per-metric rate gate. Returns None when this metric's rate says skip."""
+        rate = self.definition.metrics[entry.kind].rate
+        count = self._counters.get(entry.kind, 0) + 1
+        self._counters[entry.kind] = count
+        if count % rate != 0:
+            return None
         return {
-            "type": "metrics",
-            "session_id": str(self.definition.session.session_id),
-            "records": [
+            "type": "log",
+            "session_id": self._session_id(),
+            "entries": [
                 {
-                    "step": record.step,
-                    "timestamp": record.timestamp.isoformat(),
-                    "metrics": record.metrics,
+                    "kind": entry.kind,
+                    "step": entry.step,
+                    "timestamp": entry.timestamp.isoformat(),
+                    "dtype": entry.dtype,    # inferred by parser, not declared by user
+                    "data": entry.data,
                 }
             ],
         }
 
-    def metrics_payload(self, records: list[MetricRecord] | None = None) -> dict:
-        if records is None:
-            records = self.collector.records
+    def logs_payload(self, entries: list[LogEntry] | None = None) -> dict:
+        """Batch payload for all buffered entries (non-streaming flush)."""
+        if entries is None:
+            entries = self.collector.entries
         return {
-            "type": "metrics",
-            "session_id": str(self.definition.session.session_id),
-            "records": [
+            "type": "log",
+            "session_id": self._session_id(),
+            "entries": [
                 {
-                    "step": r.step,
-                    "timestamp": r.timestamp.isoformat(),
-                    "metrics": r.metrics,
+                    "kind": e.kind,
+                    "step": e.step,
+                    "timestamp": e.timestamp.isoformat(),
+                    "data": e.data,
                 }
-                for r in records
+                for e in entries
             ],
         }
 
     def end_payload(self) -> dict:
         return {
             "type": "end",
-            "session_id": str(self.definition.session.session_id),
+            "session_id": self._session_id(),
         }
 
 
@@ -290,11 +362,11 @@ class Send:
         self._send(arranger.registration_payload())
 
     def flush(self, arranger: "Arrange"):
-        """Send all pending metric records and clear the collector buffer."""
-        if not arranger.collector.records:
+        """Send all buffered entries and clear the buffer."""
+        if not arranger.collector.entries:
             return
-        self._send(arranger.metrics_payload())
-        arranger.collector.records.clear()
+        self._send(arranger.logs_payload())
+        arranger.collector.entries.clear()
 
     def end(self, arranger: "Arrange"):
         """Flush remaining metrics and signal end-of-session to the backend."""

@@ -4,7 +4,6 @@ use std::path::PathBuf;
 use crate::core::session::SessionState;
 
 
-// Directory: ~/.rooster/sessions/<session_id>/
 fn session_dir(session_id: &str) -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home)
@@ -15,9 +14,9 @@ fn session_dir(session_id: &str) -> PathBuf {
 
 
 // Called when a connection closes without a clean End message.
-// Writes the last received MetricRecord to disk so the CLI can recover it.
+// Writes the last received Log entry to disk so the CLI can recover it.
 pub fn persist_last_record(state: &SessionState) {
-    let Some(ref record) = state.last_record else {
+    let Some(ref log) = state.last_log else {
         return;
     };
 
@@ -28,12 +27,12 @@ pub fn persist_last_record(state: &SessionState) {
     }
 
     let path = dir.join("last.json");
-    match serde_json::to_string_pretty(record) {
+    match serde_json::to_string_pretty(log) {
         Ok(data) => {
             if let Err(e) = fs::write(&path, data) {
-                eprintln!("rooster: could not write last record to {:?}: {e}", path);
+                eprintln!("rooster: could not write last log to {:?}: {e}", path);
             }
         }
-        Err(e) => eprintln!("rooster: could not serialize last record: {e}"),
+        Err(e) => eprintln!("rooster: could not serialize last log: {e}"),
     }
 }

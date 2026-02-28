@@ -5,7 +5,7 @@ use axum::{
     Router,
 };
 
-use crate::core::session::{establish_connection, ClientMessage};
+use crate::core::session::{establish_connection, ClientMessage, MetricType, SessionState};
 use crate::core::storage::persist_last_record;
 
 
@@ -31,23 +31,10 @@ async fn handle_socket(mut socket: WebSocket) {
     loop {
         match socket.recv().await {
             Some(Ok(Message::Text(text))) => {
-                match serde_json::from_str::<ClientMessage>(&text) {
-                    Ok(ClientMessage::Metrics(payload)) => {
-                        state.last_record = payload.records.into_iter().last();
-                    }
-                    Ok(ClientMessage::End(_)) => {
-                        state.ended_cleanly = true;
-                        break;
-                    }
-                    Ok(ClientMessage::Register(_)) => {
-                        eprintln!("rooster: unexpected re-registration, ignoring");
-                    }
-                    Err(e) => {
-                        eprintln!("rooster: parse error: {e}");
-                    }
+                if dispatch(&text, &mut state) {
+                    break;
                 }
             }
-
             Some(Ok(Message::Close(_))) => break,
             None | Some(Err(_)) => break,
             _ => {}
@@ -56,5 +43,42 @@ async fn handle_socket(mut socket: WebSocket) {
 
     if !state.ended_cleanly {
         persist_last_record(&state);
+    }
+}
+
+
+/// Parse a raw text frame into a `ClientMessage` and act on it.
+/// Returns `true` when the session should end (End message received).
+fn dispatch(text: &str, state: &mut SessionState) -> bool {
+    let msg = match serde_json::from_str::<ClientMessage>(text) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("rooster: parse error: {e}");
+            return false;
+        }
+    };
+
+    match msg {
+        ClientMessage::Log(payload) => {
+            for entry in &payload.entries {
+                // On first log for this metric, infer dtype from the first data value
+                // and record it in the session's metrics map.
+                if let Some(def) = state.metrics.get_mut(&entry.kind) {
+                    if def.dtype.is_none() {
+                        def.dtype = entry.data.values().next().map(MetricType::from);
+                    }
+                }
+            }
+            state.last_log = payload.entries.into_iter().last();
+            false
+        }
+        ClientMessage::End(_) => {
+            state.ended_cleanly = true;
+            true
+        }
+        ClientMessage::Register(_) => {
+            eprintln!("rooster: unexpected re-registration, ignoring");
+            false
+        }
     }
 }

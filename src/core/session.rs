@@ -21,11 +21,26 @@ pub enum MetricValue {
 
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]   // matches Python's _infer_dtype strings
 pub enum MetricType {
     Bool,
     Int,
     Float,
     Str,
+}
+
+
+// ── Metric definition ─────────────────────────────────────────────────────────
+//
+// dtype is absent from the registration payload (user doesn't declare it).
+// It is inferred from the first log entry that arrives for this metric and
+// filled in then, so the session always reflects the true wire type.
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricDef {
+    #[serde(default)]
+    pub dtype: Option<MetricType>,
+    pub rate: u32,
 }
 
 impl From<&MetricValue> for MetricType {
@@ -56,8 +71,25 @@ impl Metric {
 
 
 
-//   for exmple; { "step": u64, "timestamp": "<ISO-8601>", "metrics": { "<name>": <value> } }
+// ── Log — general purpose entry ───────────────────────────────────────────────
+//
+// kind  : user-defined label ("loss", "gradient", "custom", anything)
+// step  : training step index
+// data  : any key → any scalar value the user wants recorded
+//
+// Wire format:
+//   { "kind": "loss", "step": 5, "timestamp": "...", "data": { "loss": 0.4, ... } }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Log {
+    pub kind: String,
+    pub step: u64,
+    pub timestamp: String,
+    pub dtype: String,                      // inferred by Python parser, e.g. "float"
+    pub data: HashMap<String, MetricValue>,
+}
+
+// Kept for internal use where a plain step+metrics record is needed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricRecord {
     pub step: u64,
@@ -89,19 +121,17 @@ pub struct SessionInfo {
     pub framework: Framework,
 }
 
-
-
-
 #[derive(Debug, Deserialize)]
 pub struct RegisterPayload {
     pub project: ProjectInfo,
     pub session: SessionInfo,
+    pub metrics: HashMap<String, MetricDef>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct MetricsPayload {
+pub struct LogPayload {
     pub session_id: String,
-    pub records: Vec<MetricRecord>,
+    pub entries: Vec<Log>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -113,25 +143,31 @@ pub struct EndPayload {
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ClientMessage {
     Register(RegisterPayload),
-    Metrics(MetricsPayload),
+    Log(LogPayload),
     End(EndPayload),
 }
+
+
 
 
 
 pub struct SessionState {
     pub session: SessionInfo,
     pub project: ProjectInfo,
-    pub last_record: Option<MetricRecord>,
+    /// Metric schema: name → MetricDef.
+    /// dtype starts as None and is filled in from the first log entry for each metric.
+    pub metrics: HashMap<String, MetricDef>,
+    pub last_log: Option<Log>,
     pub ended_cleanly: bool,
 }
 
 impl SessionState {
-    pub fn new(session: SessionInfo, project: ProjectInfo) -> Self {
+    pub fn new(session: SessionInfo, project: ProjectInfo, metrics: HashMap<String, MetricDef>) -> Self {
         Self {
             session,
             project,
-            last_record: None,
+            metrics,
+            last_log: None,
             ended_cleanly: false,
         }
     }
@@ -162,7 +198,9 @@ pub async fn establish_connection(
     match serde_json::from_str::<ClientMessage>(&text)
         .map_err(|e| format!("invalid Register payload: {e}"))?
     {
-        ClientMessage::Register(p) => Ok(SessionState::new(p.session, p.project)),
+        ClientMessage::Register(p) => Ok(SessionState::new(p.session, p.project, p.metrics)),
         other => Err(format!("first message must be Register, got {:?}", other).into()),
     }
 }
+
+
