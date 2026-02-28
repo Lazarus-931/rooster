@@ -328,8 +328,10 @@ class Send:
         self.url = url
         self.retries = retries
         self._ws: websocket.WebSocket | None = None
+        self._arranger: "Arrange | None" = None  # set in register(); used by shutdown
+        self._ended = False                        # guards against double end-message
         self._connect()
-        atexit.register(self.close)
+        atexit.register(self._shutdown)
         signal.signal(signal.SIGTERM, self._handle_signal)
 
     def _connect(self):
@@ -359,6 +361,8 @@ class Send:
             self._ws.send(data)
 
     def register(self, arranger: "Arrange"):
+        # Store so atexit / SIGTERM can send End without the caller doing it manually.
+        self._arranger = arranger
         self._send(arranger.registration_payload())
 
     def flush(self, arranger: "Arrange"):
@@ -369,9 +373,28 @@ class Send:
         arranger.collector.entries.clear()
 
     def end(self, arranger: "Arrange"):
-        """Flush remaining metrics and signal end-of-session to the backend."""
+        """Flush remaining buffered entries and send End to the backend.
+
+        Idempotent — safe to call more than once (atexit will call it again).
+        """
+        if self._ended:
+            return
+        self._ended = True
         self.flush(arranger)
         self._send(arranger.end_payload())
+
+    def _shutdown(self):
+        """Send End (if not already sent) then close the socket.
+
+        Called by atexit on normal exit and by the SIGTERM handler.
+        Uses best-effort delivery — if the socket is already gone, we skip silently.
+        """
+        if not self._ended and self._arranger is not None:
+            try:
+                self.end(self._arranger)
+            except Exception:
+                pass  # socket may be dead; the server will fall back to last.json
+        self.close()
 
     def close(self):
         if self._ws:
@@ -382,4 +405,7 @@ class Send:
             self._ws = None
 
     def _handle_signal(self, signum, frame):
-        self.close()
+        self._shutdown()
+        # Re-raise with the default handler so the process exits with the right code.
+        signal.signal(signum, signal.SIG_DFL)
+        signal.raise_signal(signum)

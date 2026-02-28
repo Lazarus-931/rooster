@@ -1,12 +1,11 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqliteSynchronous};
 
-use crate::core::session::{Log, ProjectInfo, SessionInfo, SessionState};
+use crate::core::session::{Log, SessionState};
 
 
-// Only the fixed sessions table lives here.
-// Per-metric tables are created dynamically in `create_tables`.
 const SESSIONS_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
     session_id          TEXT PRIMARY KEY,
@@ -34,7 +33,15 @@ impl Db {
 
         let opts = SqliteConnectOptions::new()
             .filename(&path)
-            .create_if_missing(true);
+            .create_if_missing(true)
+            // WAL: server can write while the CLI reads — no "database is locked" errors
+            .journal_mode(SqliteJournalMode::Wal)
+            // NORMAL: data survives OS crashes; use FULL for power-loss safety
+            .synchronous(SqliteSynchronous::Normal)
+            // Wait up to 5s on lock contention before returning an error
+            .busy_timeout(Duration::from_secs(5))
+            // SQLite ignores FK constraints by default — enforce them per-connection
+            .pragma("foreign_keys", "ON");
 
         let pool = SqlitePool::connect_with(opts).await?;
         sqlx::query(SESSIONS_SCHEMA).execute(&pool).await?;
@@ -42,49 +49,56 @@ impl Db {
         Ok(Self { pool })
     }
 
-    /// For each metric declared in the session, create a dedicated table:
-    ///   metric_{name}(id, session_id, step, timestamp, value TEXT)
+    /// Register a new session atomically:
+    ///   1. Insert the session row.
+    ///   2. CREATE TABLE for every declared metric.
     ///
-    /// `value` stores the JSON-serialized `data` dict from the Log entry.
-    /// Called once after `insert_session`, so the schema is ready before any logs arrive.
-    pub async fn create_tables(&self, state: &SessionState) -> Result<(), sqlx::Error> {
-        for name in state.metrics.keys() {
-            let table = sanitize_name(name);
-            let sql = format!(
-                "CREATE TABLE IF NOT EXISTS {table} (\
-                    id         INTEGER PRIMARY KEY AUTOINCREMENT, \
-                    session_id TEXT    NOT NULL, \
-                    step       INTEGER NOT NULL, \
-                    timestamp  TEXT    NOT NULL, \
-                    value      TEXT    NOT NULL, \
-                    FOREIGN KEY (session_id) REFERENCES sessions(session_id)\
-                )"
-            );
-            sqlx::query(&sql).execute(&self.pool).await?;
-        }
-        Ok(())
-    }
+    /// Both steps run inside a single transaction — either the whole session is
+    /// visible to the CLI or none of it is. A partial registration is never stored.
+    pub async fn register_session(&self, state: &SessionState) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
 
-    pub async fn insert_session(&self, session: &SessionInfo, project: &ProjectInfo) -> Result<(), sqlx::Error> {
         sqlx::query(
             "INSERT OR IGNORE INTO sessions \
              (session_id, project_id, name, framework, project_name, project_description, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, datetime('now'))"
+             VALUES (?, ?, ?, ?, ?, ?, datetime('now'))",
         )
-            .bind(&session.session_id)
-            .bind(&session.project_id)
-            .bind(&session.name)
-            .bind(format!("{:?}", session.framework))
-            .bind(&project.name)
-            .bind(&project.description)
-            .execute(&self.pool)
-            .await?;
+        .bind(&state.session.session_id)
+        .bind(&state.session.project_id)
+        .bind(&state.session.name)
+        .bind(format!("{:?}", state.session.framework))
+        .bind(&state.project.name)
+        .bind(&state.project.description)
+        .execute(&mut *tx)
+        .await?;
 
+        for name in state.metrics.keys() {
+            let table = sanitize_name(name);
+            // Table columns:
+            //   session_id — ties each row back to the session
+            //   step       — training step index
+            //   timestamp  — ISO-8601 string from the client
+            //   value      — JSON dict of everything in Log.data for this step
+            let sql = format!(
+                "CREATE TABLE IF NOT EXISTS {table} ( \
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT, \
+                    session_id TEXT    NOT NULL REFERENCES sessions(session_id), \
+                    step       INTEGER NOT NULL, \
+                    timestamp  TEXT    NOT NULL, \
+                    value      TEXT    NOT NULL \
+                )"
+            );
+            sqlx::query(&sql).execute(&mut *tx).await?;
+        }
+
+        tx.commit().await?;
         Ok(())
     }
 
-    /// Insert a log entry into the per-metric table for `log.kind`.
-    /// `log.data` is JSON-serialized as the `value` column.
+    /// Append one log entry to the metric-specific table for `log.kind`.
+    ///
+    /// A single INSERT is already atomic in SQLite — no explicit transaction needed.
+    /// `log.data` is stored as a JSON object so multi-key entries are preserved exactly.
     pub async fn insert_log(&self, session_id: &str, log: &Log) -> Result<(), sqlx::Error> {
         let table = sanitize_name(&log.kind);
         let value = serde_json::to_string(&log.data).unwrap_or_else(|_| "{}".to_string());
@@ -112,8 +126,8 @@ fn default_db_path() -> PathBuf {
 }
 
 /// Produce a safe SQLite table identifier from a metric name.
-/// Non-alphanumeric/underscore chars are replaced with '_'.
-/// Always prefixed with "metric_" so names like "123" remain valid.
+/// Any character that isn't alphanumeric or `_` is replaced with `_`.
+/// Always prefixed with "metric_" so bare digits ("123") stay valid identifiers.
 fn sanitize_name(name: &str) -> String {
     let s: String = name
         .chars()

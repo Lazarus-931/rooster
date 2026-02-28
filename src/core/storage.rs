@@ -36,3 +36,8 @@ pub fn persist_last_record(state: &SessionState) {
         Err(e) => eprintln!("rooster: could not serialize last log: {e}"),
     }
 }
+
+
+pub struct Database {
+
+}
