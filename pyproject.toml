@@ -1,8 +1,16 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "rooster"
 version = "0.1.0"
-description = "Add your description here"
-requires-python = ">=3.13"
+description = "CLI-native tool for visualizing ML training runs"
+requires-python = ">=3.10"
 dependencies = [
-    "pydantic>=2.12.5",
+    "pydantic>=2.0",
+    "websocket-client>=1.6",
 ]
+
+[tool.hatch.build.targets.wheel]
+packages = ["client/rooster"]

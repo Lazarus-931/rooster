@@ -4,6 +4,7 @@ use std::time::Duration;
 use axum::extract::ws::{Message, WebSocket};
 use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
+use tracing::{info, warn};
 
 
 
@@ -55,22 +56,6 @@ impl From<&MetricValue> for MetricType {
 }
 
 
-// ── Named metric with derived dtype ──────────────────────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Metric {
-    pub name: String,
-    pub value: MetricValue,
-}
-
-impl Metric {
-    pub fn dtype(&self) -> MetricType {
-        MetricType::from(&self.value)
-    }
-}
-
-
-
 // ── Log — general purpose entry ───────────────────────────────────────────────
 //
 // kind  : user-defined label ("loss", "gradient", "custom", anything)
@@ -88,16 +73,6 @@ pub struct Log {
     pub dtype: String,                      // inferred by Python parser, e.g. "float"
     pub data: HashMap<String, MetricValue>,
 }
-
-// Kept for internal use where a plain step+metrics record is needed.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MetricRecord {
-    pub step: u64,
-    pub timestamp: String,
-    pub metrics: HashMap<String, MetricValue>,
-}
-
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectInfo {
@@ -130,12 +105,18 @@ pub struct RegisterPayload {
 
 #[derive(Debug, Deserialize)]
 pub struct LogPayload {
+    /// Present in every Log wire frame; the active session is tracked via
+    /// `SessionState` so this field is deserialized but not accessed in code.
+    #[allow(dead_code)]
     pub session_id: String,
     pub entries: Vec<Log>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct EndPayload {
+    /// Deserialized from the wire frame but not accessed — session identity is
+    /// carried by `SessionState`.
+    #[allow(dead_code)]
     pub session_id: String,
 }
 
@@ -144,6 +125,9 @@ pub struct EndPayload {
 pub enum ClientMessage {
     Register(RegisterPayload),
     Log(LogPayload),
+    /// Inner payload deserialized from the wire but not accessed in code —
+    /// receiving this variant alone is sufficient to mark the session complete.
+    #[allow(dead_code)]
     End(EndPayload),
 }
 
@@ -186,20 +170,37 @@ pub async fn establish_connection(
 
     let frame = timeout(REGISTER_TIMEOUT, socket.recv())
         .await
-        .map_err(|_| "timed out waiting for Register message")?
+        .map_err(|_| {
+            warn!("timed out waiting for Register message (10s)");
+            "timed out waiting for Register message"
+        })?
         .ok_or("socket closed before Register message")?
         .map_err(|e| format!("WebSocket error: {e}"))?;
 
     let text = match frame {
         Message::Text(t) => t,
-        other => return Err(format!("expected text frame, got {:?}", other).into()),
+        other => {
+            warn!(frame = ?other, "expected text frame for Register, got something else");
+            return Err(format!("expected text frame, got {:?}", other).into());
+        }
     };
 
     match serde_json::from_str::<ClientMessage>(&text)
         .map_err(|e| format!("invalid Register payload: {e}"))?
     {
-        ClientMessage::Register(p) => Ok(SessionState::new(p.session, p.project, p.metrics)),
-        other => Err(format!("first message must be Register, got {:?}", other).into()),
+        ClientMessage::Register(p) => {
+            info!(
+                session_id = %p.session.session_id,
+                session_name = %p.session.name,
+                metrics = ?p.metrics.keys().collect::<Vec<_>>(),
+                "Register received"
+            );
+            Ok(SessionState::new(p.session, p.project, p.metrics))
+        }
+        other => {
+            warn!(msg = ?other, "first message must be Register");
+            Err(format!("first message must be Register, got {:?}", other).into())
+        }
     }
 }
 

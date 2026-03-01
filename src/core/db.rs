@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqliteSynchronous};
+use tracing::{debug, error, info};
 
 use crate::core::session::{Log, SessionState};
 
@@ -29,6 +30,8 @@ impl Db {
     }
 
     pub async fn open_at(path: PathBuf) -> Result<Self, sqlx::Error> {
+        info!(path = ?path, "opening rooster database");
+
         std::fs::create_dir_all(path.parent().unwrap()).ok();
 
         let opts = SqliteConnectOptions::new()
@@ -46,6 +49,7 @@ impl Db {
         let pool = SqlitePool::connect_with(opts).await?;
         sqlx::query(SESSIONS_SCHEMA).execute(&pool).await?;
 
+        info!(path = ?path, "database ready");
         Ok(Self { pool })
     }
 
@@ -56,6 +60,10 @@ impl Db {
     /// Both steps run inside a single transaction — either the whole session is
     /// visible to the CLI or none of it is. A partial registration is never stored.
     pub async fn register_session(&self, state: &SessionState) -> Result<(), sqlx::Error> {
+        let sid = &state.session.session_id;
+        let metric_names: Vec<&String> = state.metrics.keys().collect();
+        info!(session_id = %sid, metrics = ?metric_names, "registering session");
+
         let mut tx = self.pool.begin().await?;
 
         sqlx::query(
@@ -70,15 +78,15 @@ impl Db {
         .bind(&state.project.name)
         .bind(&state.project.description)
         .execute(&mut *tx)
-        .await?;
+        .await
+        .map_err(|e| {
+            error!(session_id = %sid, error = %e, "failed to insert session row");
+            e
+        })?;
 
         for name in state.metrics.keys() {
             let table = sanitize_name(name);
-            // Table columns:
-            //   session_id — ties each row back to the session
-            //   step       — training step index
-            //   timestamp  — ISO-8601 string from the client
-            //   value      — JSON dict of everything in Log.data for this step
+            debug!(session_id = %sid, table = %table, "creating metric table");
             let sql = format!(
                 "CREATE TABLE IF NOT EXISTS {table} ( \
                     id         INTEGER PRIMARY KEY AUTOINCREMENT, \
@@ -88,10 +96,18 @@ impl Db {
                     value      TEXT    NOT NULL \
                 )"
             );
-            sqlx::query(&sql).execute(&mut *tx).await?;
+            sqlx::query(&sql).execute(&mut *tx).await.map_err(|e| {
+                error!(session_id = %sid, table = %table, error = %e, "failed to create metric table");
+                e
+            })?;
         }
 
-        tx.commit().await?;
+        tx.commit().await.map_err(|e| {
+            error!(session_id = %sid, error = %e, "transaction commit failed");
+            e
+        })?;
+
+        info!(session_id = %sid, "session registered");
         Ok(())
     }
 
@@ -101,6 +117,8 @@ impl Db {
     /// `log.data` is stored as a JSON object so multi-key entries are preserved exactly.
     pub async fn insert_log(&self, session_id: &str, log: &Log) -> Result<(), sqlx::Error> {
         let table = sanitize_name(&log.kind);
+        debug!(session_id = %session_id, kind = %log.kind, step = log.step, "writing log entry");
+
         let value = serde_json::to_string(&log.data).unwrap_or_else(|_| "{}".to_string());
 
         sqlx::query(&format!(
@@ -111,7 +129,11 @@ impl Db {
         .bind(&log.timestamp)
         .bind(value)
         .execute(&self.pool)
-        .await?;
+        .await
+        .map_err(|e| {
+            error!(session_id = %session_id, kind = %log.kind, step = log.step, error = %e, "failed to write log entry");
+            e
+        })?;
 
         Ok(())
     }
