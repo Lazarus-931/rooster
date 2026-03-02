@@ -4,6 +4,11 @@ A local-first CLI tool for tracking and visualizing ML training runs.
 
 No cloud. No accounts. Runs entirely on your machine.
 
+
+recording
+
+https://github.com/user-attachments/assets/39115541-53cd-4d89-adbd-6b681b235f59
+
 ---
 
 ## What it does
